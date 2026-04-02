@@ -105,7 +105,6 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "Adhesiveness reading 3",
         "Adhesiveness on Inspection Report",
         "Adhesiveness on COA",
-        "LOT#",
         "Year",
     ]
     for col in numeric_cols:
@@ -114,6 +113,7 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     text_cols = [
         "Lot Number",
+        "LOT#",
         "Product Range",
         "Reference code",
         "Remarks",
@@ -277,7 +277,6 @@ selected_product_ranges = st.sidebar.multiselect(
     default=st.session_state.selected_product_ranges,
     key="selected_product_ranges"
 )
-
 if selected_product_ranges:
     st.sidebar.caption("Sélection actuelle / Current selection")
     for item in selected_product_ranges:
@@ -609,7 +608,37 @@ with tab3:
             "Use the sidebar checkbox to display raw data."
         )
 
-    csv_data = filtered_df.to_csv(index=False).encode("utf-8")
+    download_df = filtered_df.copy()
+
+    # Ensure LOT# is included if available
+    columns_order = [
+        "Year",
+        "Product Range",
+        "Reference code",
+        "Lot Number",
+        "LOT#",
+        "Adhesiveness on Inspection Report",
+        "Adhesiveness on COA",
+        "Discrepancy"
+    ]
+
+
+    # Keep only existing columns (avoid errors)
+    columns_order = [col for col in columns_order if col in download_df.columns]
+
+    download_df = download_df[columns_order]
+    download_df = download_df.rename(columns={
+    "Product Range": "Product Range",
+    "Reference code": "Product Reference",
+    "Lot Number": "Shipment LOT (YYMM)",
+    "LOT#": "Product LOT#",
+    "Adhesiveness on Inspection Report": "Inspection",
+    "Adhesiveness on COA": "COA",
+    "Discrepancy": "Discrepancy"
+    })
+
+    csv_data = download_df.to_csv(index=False).encode("utf-8")
+
     st.download_button(
         "⬇️ Télécharger les données filtrées / Download filtered CSV",
         data=csv_data,
