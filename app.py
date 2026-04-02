@@ -1,11 +1,8 @@
-import io
-from typing import Optional
-
 import pandas as pd
 import plotly.express as px
-import requests
 import streamlit as st
-from openpyxl import load_workbook
+from typing import Optional
+from urllib.parse import quote
 
 # =========================================================
 # Page config
@@ -17,18 +14,16 @@ st.set_page_config(
 )
 
 # =========================================================
-# Constants
+# Defaults
 # =========================================================
-DEFAULT_LOCAL_FILE = r"Z:\PRODUCTS\Product Monitoring Trend\FORYOU\ABSOFOAM Adhesiveness Trend.xlsx"
 DEFAULT_SHEET_NAME = "Data"
+DEFAULT_GOOGLE_SHEET_ID = ""
 
-# Optional default URL from Streamlit secrets
-DEFAULT_ONEDRIVE_URL = ""
-if "onedrive" in st.secrets and "direct_url" in st.secrets["onedrive"]:
-    DEFAULT_ONEDRIVE_URL = st.secrets["onedrive"]["direct_url"]
+if "gsheets" in st.secrets and "sheet_id" in st.secrets["gsheets"]:
+    DEFAULT_GOOGLE_SHEET_ID = st.secrets["gsheets"]["sheet_id"]
 
 # =========================================================
-# UI helpers
+# Formatting helpers
 # =========================================================
 def format_number(value: Optional[float], decimals: int = 2) -> str:
     if pd.isna(value):
@@ -42,27 +37,18 @@ def format_percent(value: Optional[float], decimals: int = 1) -> str:
     return f"{value:.{decimals}%}"
 
 
-def info_box(message: str) -> None:
-    st.info(message)
-
-
 # =========================================================
 # Data normalization
 # =========================================================
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # Remove fully empty columns
     df = df.dropna(axis=1, how="all")
-
-    # Normalize column names
     df.columns = [str(col).strip() for col in df.columns]
 
-    # Standardize reference code naming if needed
     if "Reference Code" in df.columns and "Reference code" not in df.columns:
         df = df.rename(columns={"Reference Code": "Reference code"})
 
-    # Numeric columns
     numeric_cols = [
         "Adhesiveness reading 1",
         "Adhesiveness reading 2",
@@ -77,7 +63,6 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Text columns
     text_cols = [
         "Lot Number",
         "Product Range",
@@ -87,18 +72,12 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     for col in text_cols:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip()
-
-    # Clean fake "nan" strings created by astype(str)
-    for col in text_cols:
-        if col in df.columns:
             df[col] = df[col].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
 
-    # Remove rows that are empty on key identifiers
     key_cols = [col for col in ["Product Range", "Lot Number"] if col in df.columns]
     if key_cols:
         df = df.dropna(subset=key_cols, how="all")
 
-    # Keep Year nullable integer if possible
     if "Year" in df.columns:
         df["Year"] = df["Year"].astype("Int64")
 
@@ -106,72 +85,14 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================================================
-# File loading
+# Google Sheets loading
 # =========================================================
-def load_excel_data_from_bytes(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True)
-    worksheet = workbook[sheet_name]
-    rows = worksheet.values
-    columns = next(rows)
-    df = pd.DataFrame(rows, columns=columns)
-    return normalize_dataframe(df)
-
-
-def load_excel_data_from_path(path: str, sheet_name: str) -> pd.DataFrame:
-    workbook = load_workbook(path, data_only=True)
-    worksheet = workbook[sheet_name]
-    rows = worksheet.values
-    columns = next(rows)
-    df = pd.DataFrame(rows, columns=columns)
-    return normalize_dataframe(df)
-
-
-def build_download_hint(url: str) -> str:
-    if "download=1" in url:
-        return url
-    if "?" in url:
-        return f"{url}&download=1"
-    return f"{url}?download=1"
-
-
 @st.cache_data(show_spinner=False)
-def load_data_from_url(url: str, sheet_name: str) -> pd.DataFrame:
-    """
-    Attempts to load an Excel workbook from URL.
-    Raises a clear error if the URL returns HTML instead of an XLSX file.
-    """
-    response = requests.get(
-        url,
-        timeout=45,
-        allow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0"}
-    )
-    response.raise_for_status()
-
-    content_type = response.headers.get("Content-Type", "").lower()
-
-    # Common sign that a sharing page / preview page is being returned
-    if "text/html" in content_type:
-        suggested_url = build_download_hint(url)
-        raise ValueError(
-            "The provided link returns a web page instead of the Excel file.\n\n"
-            "Please use a direct-download link. You can try this first:\n"
-            f"{suggested_url}"
-        )
-
-    # XLSX is a zip-based file format, usually starts with PK
-    if not response.content[:2] == b"PK":
-        raise ValueError(
-            "The downloaded content is not a valid Excel .xlsx file.\n\n"
-            "This usually means the OneDrive link is a preview/share page, not a direct file download."
-        )
-
-    return load_excel_data_from_bytes(response.content, sheet_name)
-
-
-@st.cache_data(show_spinner=False)
-def load_data_from_local(path: str, sheet_name: str) -> pd.DataFrame:
-    return load_excel_data_from_path(path, sheet_name)
+def load_data_from_gsheet(sheet_id: str, sheet_name: str) -> pd.DataFrame:
+    encoded_sheet_name = quote(sheet_name)
+    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet={encoded_sheet_name}"
+    df = pd.read_csv(url)
+    return normalize_dataframe(df)
 
 
 # =========================================================
@@ -187,9 +108,7 @@ def validate_required_columns(df: pd.DataFrame) -> None:
     ]
     missing_columns = [col for col in required_columns if col not in df.columns]
     if missing_columns:
-        st.error(
-            f"Colonnes manquantes / Missing required columns: {missing_columns}"
-        )
+        st.error(f"Colonnes manquantes / Missing required columns: {missing_columns}")
         st.stop()
 
 
@@ -204,72 +123,39 @@ st.caption("Suivi interactif de l’adhésivité | Interactive adhesiveness moni
 # =========================================================
 st.sidebar.header("Source des données / Data source")
 
-data_source = st.sidebar.radio(
-    "Choisir la source / Choose source",
-    options=["OneDrive link", "Upload file", "Local Excel file"],
-    index=0
-)
-
 sheet_name = st.sidebar.text_input(
     "Nom de feuille / Sheet name",
     value=DEFAULT_SHEET_NAME
+)
+
+sheet_id = st.sidebar.text_input(
+    "Google Sheet ID",
+    value=DEFAULT_GOOGLE_SHEET_ID,
+    help="Paste the Google Sheet ID from the spreadsheet URL"
 )
 
 df = None
 load_error = None
 
 try:
-    if data_source == "OneDrive link":
-        onedrive_url = st.sidebar.text_input(
-            "Lien OneDrive / OneDrive URL",
-            value=DEFAULT_ONEDRIVE_URL,
-            help="Use a direct Excel file URL if possible. A normal share page may fail."
+    if sheet_id:
+        df = load_data_from_gsheet(sheet_id, sheet_name)
+    else:
+        st.info(
+            "Veuillez coller le Google Sheet ID dans la barre latérale.\n\n"
+            "Please paste the Google Sheet ID in the sidebar."
         )
-
-        if onedrive_url:
-            df = load_data_from_url(onedrive_url, sheet_name)
-        else:
-            info_box(
-                "Collez un lien OneDrive direct, ou utilisez Upload file.\n\n"
-                "Paste a direct OneDrive link, or use Upload file."
-            )
-
-    elif data_source == "Upload file":
-        uploaded_file = st.sidebar.file_uploader(
-            "Téléverser le fichier Excel / Upload Excel file",
-            type=["xlsx"]
-        )
-        if uploaded_file is not None:
-            df = load_excel_data_from_bytes(uploaded_file.read(), sheet_name)
-        else:
-            info_box(
-                "Veuillez téléverser un fichier Excel pour continuer.\n\n"
-                "Please upload an Excel file to continue."
-            )
-
-    elif data_source == "Local Excel file":
-        local_path = st.sidebar.text_input(
-            "Chemin local / Local path",
-            value=DEFAULT_LOCAL_FILE
-        )
-        df = load_data_from_local(local_path, sheet_name)
-
 except Exception as exc:
     load_error = str(exc)
 
-# =========================================================
-# Graceful load fallback messaging
-# =========================================================
 if load_error:
     st.error(f"Erreur de chargement / Loading error:\n\n{load_error}")
-
-    if data_source == "OneDrive link":
-        st.warning(
-            "Suggestion:\n"
-            "1. Try appending `&download=1` to your OneDrive link.\n"
-            "2. If it still fails, switch to `Upload file` for now.\n"
-            "3. Once upload works, we can refine the OneDrive direct-download setup."
-        )
+    st.warning(
+        "Checklist:\n"
+        "1. Confirm the Google Sheet is shared as 'Anyone with the link - Viewer'\n"
+        "2. Confirm the worksheet name is correct, for example 'Data'\n"
+        "3. Confirm you pasted the Sheet ID only, not the full URL"
+    )
 
 if df is None:
     st.stop()
@@ -354,9 +240,7 @@ if selected_years and "Year" in filtered_df.columns:
     ]
 
 if filtered_df.empty:
-    st.warning(
-        "Aucune donnée pour les filtres sélectionnés / No data for the selected filters."
-    )
+    st.warning("Aucune donnée pour les filtres sélectionnés / No data for the selected filters.")
     st.stop()
 
 # =========================================================
@@ -410,9 +294,7 @@ top_left, top_right = st.columns([4, 1])
 
 with top_left:
     selected_products_text = ", ".join(selected_product_ranges) if selected_product_ranges else "All"
-    st.markdown(
-        f"**Gamme sélectionnée / Selected range:** {selected_products_text}"
-    )
+    st.markdown(f"**Gamme sélectionnée / Selected range:** {selected_products_text}")
 
 with top_right:
     if st.button("🔄 Actualiser / Refresh"):
@@ -596,10 +478,7 @@ with tab3:
     )
 
 # =========================================================
-# Footer note
+# Footer
 # =========================================================
 st.markdown("---")
-st.caption(
-    "Tip: if OneDrive loading fails, use Upload file first. "
-    "Once confirmed working, replace the share link with a direct-download link."
-)
+st.caption("Connected to Google Sheets. Update the spreadsheet, then click Refresh in the dashboard.")
