@@ -1,8 +1,10 @@
+from datetime import datetime
+from typing import Optional
+from urllib.parse import quote
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-from typing import Optional
-from urllib.parse import quote
 
 # =========================================================
 # Page config
@@ -38,6 +40,54 @@ def format_percent(value: Optional[float], decimals: int = 1) -> str:
 
 
 # =========================================================
+# Parsing helpers
+# =========================================================
+def parse_mixed_numeric(series: pd.Series) -> pd.Series:
+    """
+    Handles plain numbers, numeric strings, and percentage strings like '4.4%'.
+    Returns decimal form for percentages, e.g. '4.4%' -> 0.044.
+    """
+    s = series.copy()
+
+    # Already numeric
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+
+    s = s.astype(str).str.strip()
+
+    # Track which entries are percentages
+    is_percent = s.str.contains("%", na=False)
+
+    # Remove commas and percent signs
+    s = s.str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+
+    out = pd.to_numeric(s, errors="coerce")
+
+    # Convert percent-formatted values to decimal
+    out.loc[is_percent] = out.loc[is_percent] / 100
+
+    return out
+
+
+def compute_discrepancy(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes discrepancy as absolute percentage difference vs COA:
+    abs(Inspection - COA) / COA
+    """
+    if (
+        "Adhesiveness on Inspection Report" in df.columns
+        and "Adhesiveness on COA" in df.columns
+    ):
+        inspection = pd.to_numeric(df["Adhesiveness on Inspection Report"], errors="coerce")
+        coa = pd.to_numeric(df["Adhesiveness on COA"], errors="coerce")
+
+        discrepancy = ((inspection - coa).abs() / coa.replace(0, pd.NA))
+        df["Discrepancy"] = discrepancy
+
+    return df
+
+
+# =========================================================
 # Data normalization
 # =========================================================
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -55,7 +105,6 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         "Adhesiveness reading 3",
         "Adhesiveness on Inspection Report",
         "Adhesiveness on COA",
-        "Discrepancy",
         "LOT#",
         "Year",
     ]
@@ -74,12 +123,20 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = df[col].astype(str).str.strip()
             df[col] = df[col].replace({"nan": pd.NA, "None": pd.NA, "": pd.NA})
 
+    # Parse discrepancy robustly if present
+    if "Discrepancy" in df.columns:
+        df["Discrepancy"] = parse_mixed_numeric(df["Discrepancy"])
+
+    # Recompute discrepancy if missing or effectively empty
+    if "Discrepancy" not in df.columns or df["Discrepancy"].isna().all():
+        df = compute_discrepancy(df)
+
     key_cols = [col for col in ["Product Range", "Lot Number"] if col in df.columns]
     if key_cols:
         df = df.dropna(subset=key_cols, how="all")
 
     if "Year" in df.columns:
-        df["Year"] = df["Year"].astype("Int64")
+        df["Year"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
 
     return df
 
@@ -113,10 +170,45 @@ def validate_required_columns(df: pd.DataFrame) -> None:
 
 
 # =========================================================
+# Session-state defaults for filters
+# =========================================================
+def init_filter_state(df: pd.DataFrame) -> None:
+    product_ranges = sorted(df["Product Range"].dropna().astype(str).unique().tolist())
+    years = sorted(df["Year"].dropna().astype(int).unique().tolist()) if "Year" in df.columns else []
+
+    if "selected_product_ranges" not in st.session_state:
+        st.session_state.selected_product_ranges = product_ranges
+
+    if "selected_years" not in st.session_state:
+        st.session_state.selected_years = years
+
+    reference_df = df.copy()
+    if st.session_state.selected_product_ranges:
+        reference_df = reference_df[
+            reference_df["Product Range"].astype(str).isin(st.session_state.selected_product_ranges)
+        ]
+
+    reference_codes = []
+    if "Reference code" in reference_df.columns:
+        reference_codes = sorted(
+            reference_df["Reference code"].dropna().astype(str).unique().tolist()
+        )
+
+    if "selected_reference_codes" not in st.session_state:
+        st.session_state.selected_reference_codes = reference_codes
+
+    # Keep references valid when product range changes
+    st.session_state.selected_reference_codes = [
+        x for x in st.session_state.selected_reference_codes if x in reference_codes
+    ] or reference_codes
+
+
+# =========================================================
 # Header
 # =========================================================
 st.title("📊 ABSOFOAM – Adhesiveness Dashboard")
 st.caption("Suivi interactif de l’adhésivité | Interactive adhesiveness monitoring")
+st.caption(f"Dernière actualisation / Last refresh: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # =========================================================
 # Sidebar - Data source
@@ -128,11 +220,19 @@ sheet_name = st.sidebar.text_input(
     value=DEFAULT_SHEET_NAME
 )
 
-sheet_id = st.sidebar.text_input(
-    "Google Sheet ID",
-    value=DEFAULT_GOOGLE_SHEET_ID,
-    help="Paste the Google Sheet ID from the spreadsheet URL"
-)
+secret_sheet_id = ""
+if "gsheets" in st.secrets and "sheet_id" in st.secrets["gsheets"]:
+    secret_sheet_id = st.secrets["gsheets"]["sheet_id"]
+
+if secret_sheet_id:
+    sheet_id = secret_sheet_id
+    st.sidebar.success("Google Sheet connecté / Google Sheet connected")
+else:
+    sheet_id = st.sidebar.text_input(
+        "Google Sheet ID",
+        value=DEFAULT_GOOGLE_SHEET_ID,
+        help="Paste the Google Sheet ID from the spreadsheet URL"
+    )
 
 df = None
 load_error = None
@@ -160,28 +260,22 @@ if load_error:
 if df is None:
     st.stop()
 
-# =========================================================
-# Validate data
-# =========================================================
 validate_required_columns(df)
+init_filter_state(df)
 
 # =========================================================
 # Sidebar - Filters
 # =========================================================
 st.sidebar.header("Filtres / Filters")
 
-product_ranges = sorted(
-    df["Product Range"].dropna().astype(str).unique().tolist()
-)
-
-years = sorted(
-    df["Year"].dropna().astype(int).unique().tolist()
-) if "Year" in df.columns else []
+product_ranges = sorted(df["Product Range"].dropna().astype(str).unique().tolist())
+years = sorted(df["Year"].dropna().astype(int).unique().tolist()) if "Year" in df.columns else []
 
 selected_product_ranges = st.sidebar.multiselect(
     "Gamme produit / Product Range",
     options=product_ranges,
-    default=product_ranges[:1] if product_ranges else []
+    default=st.session_state.selected_product_ranges,
+    key="selected_product_ranges"
 )
 
 reference_df = df.copy()
@@ -196,16 +290,22 @@ if "Reference code" in reference_df.columns:
         reference_df["Reference code"].dropna().astype(str).unique().tolist()
     )
 
+# Keep references valid
+current_ref_defaults = [x for x in st.session_state.selected_reference_codes if x in reference_codes] or reference_codes
+st.session_state.selected_reference_codes = current_ref_defaults
+
 selected_reference_codes = st.sidebar.multiselect(
     "Référence produit / Product Reference",
     options=reference_codes,
-    default=reference_codes
+    default=st.session_state.selected_reference_codes,
+    key="selected_reference_codes"
 )
 
 selected_years = st.sidebar.multiselect(
     "Année / Year",
     options=years,
-    default=years
+    default=st.session_state.selected_years,
+    key="selected_years"
 )
 
 metric_choice = st.sidebar.selectbox(
@@ -218,6 +318,12 @@ show_raw_data = st.sidebar.checkbox(
     "Afficher les données brutes / Show raw data",
     value=False
 )
+
+if st.sidebar.button("Réinitialiser les filtres / Reset filters"):
+    st.session_state.selected_product_ranges = product_ranges
+    st.session_state.selected_reference_codes = reference_codes
+    st.session_state.selected_years = years
+    st.rerun()
 
 # =========================================================
 # Filter data
@@ -243,6 +349,10 @@ if filtered_df.empty:
     st.warning("Aucune donnée pour les filtres sélectionnés / No data for the selected filters.")
     st.stop()
 
+# Ensure discrepancy still exists after filtering
+if "Discrepancy" not in filtered_df.columns or filtered_df["Discrepancy"].isna().all():
+    filtered_df = compute_discrepancy(filtered_df)
+
 # =========================================================
 # Derived summaries
 # =========================================================
@@ -250,10 +360,10 @@ total_rows = len(filtered_df)
 total_lots = filtered_df["Lot Number"].nunique()
 avg_inspection = filtered_df["Adhesiveness on Inspection Report"].mean()
 avg_coa = filtered_df["Adhesiveness on COA"].mean()
-avg_discrepancy = (
-    filtered_df["Discrepancy"].mean()
-    if "Discrepancy" in filtered_df.columns
-    else pd.NA
+avg_discrepancy = filtered_df["Discrepancy"].mean() if "Discrepancy" in filtered_df.columns else pd.NA
+high_discrepancy_count = (
+    (filtered_df["Discrepancy"] > 0.10).sum()
+    if "Discrepancy" in filtered_df.columns else 0
 )
 
 chart_df = (
@@ -287,6 +397,16 @@ yearly_long["Metric"] = yearly_long["Metric"].replace({
     "Adhesiveness on COA": "COA"
 })
 
+# More robust discrepancy aggregation
+discrepancy_by_year = pd.DataFrame()
+if "Discrepancy" in filtered_df.columns:
+    discrepancy_by_year = (
+        filtered_df.dropna(subset=["Discrepancy"])
+        .groupby("Year", as_index=False)["Discrepancy"]
+        .mean()
+        .sort_values("Year")
+    )
+
 # =========================================================
 # Top summary row
 # =========================================================
@@ -304,11 +424,12 @@ with top_right:
 # =========================================================
 # KPI row
 # =========================================================
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5 = st.columns(5)
 k1.metric("Inspection moyenne / Avg Inspection", format_number(avg_inspection, 2))
 k2.metric("COA moyenne / Avg COA", format_number(avg_coa, 2))
 k3.metric("Lots uniques / Unique Lots", f"{total_lots}")
 k4.metric("Écart moyen / Avg Discrepancy", format_percent(avg_discrepancy, 1))
+k5.metric("Lots > 10% écart / Lots > 10% discrepancy", int(high_discrepancy_count))
 
 # =========================================================
 # Tabs
@@ -393,23 +514,22 @@ with tab1:
 
     with c2:
         st.subheader("Écart annuel / Yearly discrepancy")
-        if "Discrepancy" in filtered_df.columns:
-            discrepancy_by_year = (
-                filtered_df.groupby("Year", as_index=False)["Discrepancy"]
-                .mean()
-                .sort_values("Year")
-            )
-
+        if not discrepancy_by_year.empty:
             fig_disc = px.bar(
                 discrepancy_by_year,
                 x="Year",
                 y="Discrepancy",
                 title="Average discrepancy by year"
             )
-            fig_disc.update_layout(height=420)
+            fig_disc.update_layout(
+                height=420,
+                yaxis_tickformat=".0%"
+            )
             st.plotly_chart(fig_disc, use_container_width=True)
         else:
-            st.info("La colonne 'Discrepancy' n’est pas disponible / 'Discrepancy' column not available.")
+            st.info(
+                "Aucune donnée exploitable pour l'écart / No usable discrepancy data found."
+            )
 
 # =========================================================
 # TAB 2 - Analysis
@@ -445,7 +565,7 @@ with tab2:
         )
 
         fig_ref = px.bar(
-            ref_summary,
+            ref_summary.sort_values("Lots", ascending=False),
             x="Reference code",
             y="Lots",
             title="Number of lots by reference"
@@ -461,8 +581,23 @@ with tab2:
 with tab3:
     st.subheader("Données filtrées / Filtered data")
 
+    display_df = filtered_df.rename(columns={
+        "Product Range": "Gamme produit / Product Range",
+        "Reference code": "Référence produit / Product Reference",
+        "Lot Number": "Numéro de lot / Lot Number",
+        "Adhesiveness on Inspection Report": "Inspection Report",
+        "Adhesiveness on COA": "COA",
+        "Discrepancy": "Écart / Discrepancy",
+        "Year": "Année / Year",
+    }).copy()
+
+    if "Écart / Discrepancy" in display_df.columns:
+        display_df["Écart / Discrepancy"] = display_df["Écart / Discrepancy"].apply(
+            lambda x: format_percent(x, 1) if pd.notna(x) else "-"
+        )
+
     if show_raw_data:
-        st.dataframe(filtered_df, use_container_width=True)
+        st.dataframe(display_df, use_container_width=True)
     else:
         st.info(
             "Cochez l’option dans la barre latérale pour afficher les données brutes.\n\n"
