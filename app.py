@@ -278,6 +278,11 @@ selected_product_ranges = st.sidebar.multiselect(
     key="selected_product_ranges"
 )
 
+if selected_product_ranges:
+    st.sidebar.caption("Sélection actuelle / Current selection")
+    for item in selected_product_ranges:
+        st.sidebar.write(f"- {item}")
+
 reference_df = df.copy()
 if selected_product_ranges:
     reference_df = reference_df[
