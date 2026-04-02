@@ -323,11 +323,23 @@ show_raw_data = st.sidebar.checkbox(
     value=False
 )
 
-if st.sidebar.button("Réinitialiser les filtres / Reset filters"):
+def reset_filters_from_df(df):
+    product_ranges = sorted(df["Product Range"].dropna().astype(str).unique().tolist())
+    years = sorted(df["Year"].dropna().astype(int).unique().tolist()) if "Year" in df.columns else []
+
+    reference_codes = []
+    if "Reference code" in df.columns:
+        reference_codes = sorted(df["Reference code"].dropna().astype(str).unique().tolist())
+
     st.session_state.selected_product_ranges = product_ranges
     st.session_state.selected_reference_codes = reference_codes
     st.session_state.selected_years = years
-    st.rerun()
+
+st.sidebar.button(
+    "Réinitialiser les filtres / Reset filters",
+    on_click=reset_filters_from_df,
+    args=(df,),
+)
 
 # =========================================================
 # Filter data
